@@ -4,7 +4,7 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
     futures::StreamExt,
     identify,
-    identity::Keypair,
+    identity::{self, Keypair},
     kad::{self, PeerRecord, Quorum, Record, RecordKey, store::MemoryStore},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent, dial_opts::DialOpts},
 };
@@ -52,6 +52,19 @@ pub enum OverlayEvent {
     SwarmError(String),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keypair_roundtrip() {
+        let identity = UserIdentity::generate().expect("identity");
+        let mut bytes = identity.to_ed25519_keypair_bytes();
+        let ed = identity::ed25519::Keypair::try_from_bytes(&mut bytes).expect("ed25519");
+        let _ = Keypair::from(ed);
+    }
+}
+
 /// Handle returned to higher layers once the overlay task has been spawned.
 pub struct OverlayNode {
     peer_id: PeerId,
@@ -69,7 +82,8 @@ impl OverlayNode {
         } = config;
 
         let mut keypair_bytes = identity.to_ed25519_keypair_bytes();
-        let keypair = Keypair::ed25519_from_bytes(&mut keypair_bytes)?;
+        let ed25519 = identity::ed25519::Keypair::try_from_bytes(&mut keypair_bytes)?;
+        let keypair = Keypair::from(ed25519);
         let peer_id = PeerId::from(keypair.public());
 
         let mut swarm = build_swarm(keypair)?;
