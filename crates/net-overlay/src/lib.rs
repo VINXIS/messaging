@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use identity_core::UserIdentity;
 use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
     futures::StreamExt,
     identify,
     identity::Keypair,
-    kad::{self, store::MemoryStore, PeerRecord, Quorum, Record, RecordKey},
-    swarm::{dial_opts::DialOpts, NetworkBehaviour, Swarm, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    kad::{self, PeerRecord, Quorum, Record, RecordKey, store::MemoryStore},
+    swarm::{NetworkBehaviour, Swarm, SwarmEvent, dial_opts::DialOpts},
 };
 use messaging_proto::core::ServerAdvert;
 use prost::Message;
@@ -38,9 +38,16 @@ pub enum OverlayCommand {
 pub enum OverlayEvent {
     ListeningOn(Multiaddr),
     BootstrapDialQueued(Multiaddr),
-    ServerAdvertStored { server_id: String },
-    ServerAdvertFound { server_id: String, advert: ServerAdvert },
-    ServerAdvertNotFound { server_id: String },
+    ServerAdvertStored {
+        server_id: String,
+    },
+    ServerAdvertFound {
+        server_id: String,
+        advert: ServerAdvert,
+    },
+    ServerAdvertNotFound {
+        server_id: String,
+    },
     PeerDiscovered(PeerId),
     SwarmError(String),
 }
@@ -135,11 +142,13 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<Behaviour>> {
     Ok(swarm)
 }
 
-async fn handle_command(swarm: &mut Swarm<Behaviour>, command: OverlayCommand) -> Result<(), String> {
+async fn handle_command(
+    swarm: &mut Swarm<Behaviour>,
+    command: OverlayCommand,
+) -> Result<(), String> {
     match command {
         OverlayCommand::PublishServerAdvert(advert) => {
-            publish_server_advert(swarm, advert)
-                .map_err(|err| err.to_string())?;
+            publish_server_advert(swarm, advert).map_err(|err| err.to_string())?;
         }
         OverlayCommand::FindServerAdvert { server_id } => {
             let key = directory_record_key(&server_id);
@@ -163,7 +172,10 @@ async fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             event_tx.send(OverlayEvent::ListeningOn(address)).await?;
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, .. })) => {
+        SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            ..
+        })) => {
             debug!(%peer_id, "identify exchange complete");
         }
         SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad_event)) => {
@@ -173,7 +185,11 @@ async fn handle_swarm_event(
             let msg = format!("outgoing connection error with {:?}: {error}", peer_id);
             event_tx.send(OverlayEvent::SwarmError(msg)).await?;
         }
-        SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => {
+        SwarmEvent::IncomingConnectionError {
+            send_back_addr,
+            error,
+            ..
+        } => {
             let msg = format!("incoming connection error from {send_back_addr}: {error}");
             event_tx.send(OverlayEvent::SwarmError(msg)).await?;
         }

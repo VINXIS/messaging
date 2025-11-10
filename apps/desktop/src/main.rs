@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use eframe::egui;
 use identity_core::UserIdentity;
 use tracing::info;
