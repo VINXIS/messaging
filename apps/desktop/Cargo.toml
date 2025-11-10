@@ -18,4 +18,4 @@ tracing-subscriber.workspace = true
 [dependencies.eframe]
 version = "0.28"
 default-features = false
-features = ["wgpu", "wayland", "x11", "default_fonts"]
+features = ["wgpu", "default_fonts"]

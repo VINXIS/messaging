@@ -22,6 +22,10 @@ fn main() -> Result<()> {
 
 /// Verifies a windowing backend exists before spawning egui; otherwise exits with a clear error.
 fn ensure_display_env() -> Result<()> {
+    if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+        return Ok(());
+    }
+
     let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var_os("WAYLAND_SOCKET").is_some();
     let has_x11 = std::env::var_os("DISPLAY").is_some();
