@@ -1,0 +1,13 @@
+[package]
+name = "identity-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+thiserror.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "messaging-desktop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+identity-core = { path = "../../crates/identity-core" }
+messaging-proto = { path = "../../crates/messaging-proto" }
+net-overlay = { path = "../../crates/net-overlay" }
+storage-ledger = { path = "../../crates/storage-ledger" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dependencies.eframe]
+version = "0.28"
+default-features = false
+features = ["wgpu", "wayland", "x11", "default_fonts"]

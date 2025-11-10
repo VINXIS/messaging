@@ -1,0 +1,12 @@
+[package]
+name = "storage-ledger"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+identity-core = { path = "../identity-core" }
+sled.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

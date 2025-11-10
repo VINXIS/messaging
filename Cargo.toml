@@ -1,0 +1,22 @@
+[workspace]
+members = ["apps/desktop", "crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+libp2p = { version = "0.54", default-features = false, features = ["tokio", "tcp", "dns", "quic", "gossipsub", "kad", "identify", "autonat", "mdns", "macros"] }
+prost = "0.13"
+prost-build = "0.13"
+rand = "0.8"
+sled = "0.34"
+thiserror = "1.0"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "fs", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
