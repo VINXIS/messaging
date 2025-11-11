@@ -2507,6 +2507,7 @@ dependencies = [
  "libp2p",
  "messaging-proto",
  "net-overlay",
+ "serde",
  "serde_json",
  "storage-ledger",
  "tokio",

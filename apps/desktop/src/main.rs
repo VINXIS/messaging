@@ -5,6 +5,7 @@ use identity_core::UserIdentity;
 use libp2p::Multiaddr;
 use messaging_proto::core::ServerAdvert;
 use net_overlay::{OverlayCommand, OverlayConfig, OverlayEvent, OverlayNode};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque, btree_map::Entry},
     fs,
@@ -69,6 +70,7 @@ struct App {
     cached_bootstrap: Vec<Multiaddr>,
     peer_log: VecDeque<String>,
     discovered_servers: BTreeMap<String, ServerAdvert>,
+    loaded_catalog_message: Option<String>,
 }
 
 impl eframe::App for App {
@@ -80,6 +82,11 @@ impl eframe::App for App {
 
             if let Some(err) = &self.last_ui_error {
                 ui.colored_label(Color32::from_rgb(200, 50, 50), err);
+                ui.separator();
+            }
+
+            if let Some(message) = self.loaded_catalog_message.take() {
+                ui.colored_label(Color32::from_rgb(60, 170, 60), message);
                 ui.separator();
             }
 
@@ -128,7 +135,8 @@ impl App {
         let mut last_ui_error = None;
         let mut peer_log = VecDeque::new();
         let mut cached_bootstrap = Vec::new();
-        let discovered_servers = BTreeMap::new();
+        let mut discovered_servers = BTreeMap::new();
+        let mut loaded_catalog_message = None;
 
         match load_identity_from_disk() {
             Ok(Some(id)) => {
@@ -164,6 +172,22 @@ impl App {
             }
         }
 
+        match load_server_catalog() {
+            Ok(Some(catalog)) => {
+                if !catalog.is_empty() {
+                    info!(count = catalog.len(), "loaded discovered server catalog");
+                    peer_log.push_front(format!("Loaded {} servers from catalog", catalog.len()));
+                    discovered_servers = catalog;
+                    loaded_catalog_message = Some("Loaded saved server catalog".to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(?err, "failed to load server catalog");
+                last_ui_error.get_or_insert("Failed to load server catalog".to_string());
+            }
+        }
+
         Self {
             runtime,
             identity,
@@ -181,6 +205,7 @@ impl App {
             cached_bootstrap,
             peer_log,
             discovered_servers,
+            loaded_catalog_message,
         }
     }
 
@@ -203,6 +228,13 @@ impl App {
                         tracing::error!(?err, "failed to start overlay");
                         self.last_ui_error = Some(format!("Overlay launch failed: {err}"));
                     }
+                }
+            }
+
+            if !self.cached_bootstrap.is_empty() || !self.discovered_servers.is_empty() {
+                ui.add_space(6.0);
+                if ui.button("Clear cached peers & servers").clicked() {
+                    self.clear_cached_state();
                 }
             }
             return;
@@ -379,6 +411,13 @@ impl App {
                     }
                 });
         }
+
+        if !self.cached_bootstrap.is_empty() || !self.discovered_servers.is_empty() {
+            ui.add_space(6.0);
+            if ui.button("Clear cached peers & servers").clicked() {
+                self.clear_cached_state();
+            }
+        }
     }
 
     fn start_overlay(&mut self, identity: UserIdentity) -> Result<()> {
@@ -536,6 +575,38 @@ impl App {
         }
     }
 
+    fn clear_cached_state(&mut self) {
+        if self.cached_bootstrap.is_empty() && self.discovered_servers.is_empty() {
+            return;
+        }
+
+        self.cached_bootstrap.clear();
+        self.discovered_servers.clear();
+        self.loaded_catalog_message = None;
+
+        if let Err(err) = persist_known_peers(&self.cached_bootstrap) {
+            tracing::error!(?err, "failed to persist bootstrap peers after clearing");
+            self.last_ui_error
+                .get_or_insert("Failed to clear bootstrap cache".to_string());
+        }
+
+        if let Err(err) = persist_server_catalog(&self.discovered_servers) {
+            tracing::error!(?err, "failed to persist server catalog after clearing");
+            self.last_ui_error
+                .get_or_insert("Failed to clear server catalog".to_string());
+        }
+
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.push_event("Cleared cached peers and servers");
+        }
+
+        self.peer_log
+            .push_front("Cleared cached peers and servers".to_string());
+        while self.peer_log.len() > MAX_KNOWN_PEERS {
+            self.peer_log.pop_back();
+        }
+    }
+
     fn record_known_peer(&mut self, addr: Multiaddr) {
         if self
             .cached_bootstrap
@@ -598,6 +669,12 @@ impl App {
                 Ok(addr) => self.record_known_peer(addr),
                 Err(err) => warn!(%raw, ?err, "skipping advert address"),
             }
+        }
+
+        if let Err(err) = persist_server_catalog(&self.discovered_servers) {
+            tracing::error!(?err, "failed to persist server catalog");
+            self.last_ui_error
+                .get_or_insert("Failed to persist server catalog".to_string());
         }
     }
 }
@@ -736,6 +813,61 @@ fn load_cached_peers() -> Result<Vec<Multiaddr>> {
     Ok(peers)
 }
 
+fn persist_server_catalog(catalog: &BTreeMap<String, ServerAdvert>) -> Result<()> {
+    if let Some(path) = server_catalog_path() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create server catalog directory at {}", parent.display())
+            })?;
+        }
+
+        let serialized: Vec<PersistedAdvert> = catalog
+            .iter()
+            .map(|(server_id, advert)| PersistedAdvert {
+                server_id: server_id.clone(),
+                display_name: advert.display_name.clone(),
+                bootstrap_addresses: advert.bootstrap_addresses.clone(),
+                is_public: advert.is_public,
+            })
+            .collect();
+
+        let data = serde_json::to_vec(&serialized).context("serialize server catalog")?;
+        fs::write(&path, data)
+            .with_context(|| format!("write server catalog at {}", path.display()))?;
+        info!(path = %path.display(), count = catalog.len(), "persisted server catalog");
+    }
+    Ok(())
+}
+
+fn load_server_catalog() -> Result<Option<BTreeMap<String, ServerAdvert>>> {
+    let Some(path) = server_catalog_path() else {
+        return Ok(None);
+    };
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let data =
+        fs::read(&path).with_context(|| format!("read server catalog at {}", path.display()))?;
+    let entries: Vec<PersistedAdvert> = serde_json::from_slice(&data)
+        .with_context(|| format!("deserialize server catalog at {}", path.display()))?;
+
+    let mut catalog = BTreeMap::new();
+    for advert in entries {
+        let server_id = advert.server_id.clone();
+        let rebuilt = ServerAdvert {
+            server_id: advert.server_id,
+            display_name: advert.display_name,
+            bootstrap_addresses: advert.bootstrap_addresses,
+            is_public: advert.is_public,
+        };
+        catalog.insert(server_id, rebuilt);
+    }
+
+    Ok(Some(catalog))
+}
+
 fn persist_identity(identity: &UserIdentity) -> Result<()> {
     if let Some(path) = identity_storage_path() {
         if let Some(parent) = path.parent() {
@@ -777,6 +909,18 @@ fn peers_storage_path() -> Option<PathBuf> {
     project_dirs().map(|dirs| dirs.data_dir().join("bootstrap_peers.json"))
 }
 
+fn server_catalog_path() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_dir().join("server_catalog.json"))
+}
+
 fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "vinxis", "messaging")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedAdvert {
+    server_id: String,
+    display_name: String,
+    bootstrap_addresses: Vec<String>,
+    is_public: bool,
 }
