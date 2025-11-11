@@ -598,10 +598,20 @@ impl App {
         }
 
         let overlay = self.overlay.as_ref().context("overlay is not running")?;
+        let peer_id = overlay.peer_id.clone();
 
-        let mut advertised = overlay.listen_addrs.clone();
+        let mut advertised: Vec<String> = overlay
+            .listen_addrs
+            .iter()
+            .map(|addr| ensure_peer_id_suffix(addr, &peer_id))
+            .collect();
+
         let additional = parse_multiaddr_list(&self.additional_advertise_input)?;
-        advertised.extend(additional.into_iter().map(|addr| addr.to_string()));
+        advertised.extend(
+            additional
+                .into_iter()
+                .map(|addr| ensure_peer_id_suffix(&addr.to_string(), &peer_id)),
+        );
         advertised.sort();
         advertised.dedup();
 
@@ -1105,6 +1115,14 @@ fn server_catalog_path() -> Option<PathBuf> {
 
 fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "vinxis", "messaging")
+}
+
+fn ensure_peer_id_suffix(addr: &str, peer_id: &str) -> String {
+    if addr.contains("/p2p/") {
+        addr.to_string()
+    } else {
+        format!("{addr}/p2p/{peer_id}")
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

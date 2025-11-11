@@ -6,7 +6,7 @@ use libp2p::{
     identify,
     identity::{self, Keypair},
     kad::{self, PeerRecord, Quorum, Record, RecordKey, store::MemoryStore},
-    swarm::{NetworkBehaviour, Swarm, SwarmEvent, dial_opts::DialOpts},
+    swarm::{DialError, NetworkBehaviour, Swarm, SwarmEvent, dial_opts::DialOpts},
 };
 use messaging_proto::core::ServerAdvert;
 use prost::Message;
@@ -169,10 +169,21 @@ async fn handle_command(
             swarm.behaviour_mut().kademlia.get_record(key);
         }
         OverlayCommand::DialAddress(addr) => {
-            let dial = DialOpts::unknown_peer_id().address(addr.clone()).build();
-            swarm
-                .dial(dial)
-                .map_err(|err| format!("failed to dial {}: {err}", addr))?;
+            let raw = addr.to_string();
+            match swarm.dial(addr.clone()) {
+                Ok(()) => {}
+                Err(err) => match err {
+                    DialError::NoAddresses => {
+                        let dial = DialOpts::unknown_peer_id().address(addr).build();
+                        swarm.dial(dial).map_err(|fallback_err| {
+                            format!("failed to dial {raw}: {fallback_err}")
+                        })?;
+                    }
+                    other => {
+                        return Err(format!("failed to dial {raw}: {other}"));
+                    }
+                },
+            }
         }
     }
     Ok(())
@@ -273,7 +284,7 @@ fn publish_server_advert(swarm: &mut Swarm<Behaviour>, advert: ServerAdvert) -> 
     swarm
         .behaviour_mut()
         .kademlia
-        .put_record(record, Quorum::Majority)
+        .put_record(record, Quorum::One)
         .map_err(|err| anyhow::anyhow!("kad put failed: {err}"))?;
     Ok(())
 }
