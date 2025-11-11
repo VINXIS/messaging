@@ -1,12 +1,18 @@
 use anyhow::{Context, Result, bail};
+use directories::ProjectDirs;
 use eframe::egui::{self, Color32};
 use identity_core::UserIdentity;
 use libp2p::Multiaddr;
 use messaging_proto::core::ServerAdvert;
 use net_overlay::{OverlayCommand, OverlayConfig, OverlayEvent, OverlayNode};
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    fs,
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::{runtime::Runtime, sync::mpsc::error::TryRecvError};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -60,6 +66,8 @@ struct App {
     find_server_id_input: String,
     dial_addr_input: String,
     last_ui_error: Option<String>,
+    cached_bootstrap: Vec<Multiaddr>,
+    peer_log: VecDeque<String>,
 }
 
 impl eframe::App for App {
@@ -78,9 +86,16 @@ impl eframe::App for App {
                 if ui.button("Generate identity").clicked() {
                     match UserIdentity::generate() {
                         Ok(id) => {
-                            self.identity_display = id.format_public_key();
+                            let display = id.format_public_key();
+                            if let Err(err) = persist_identity(&id) {
+                                tracing::error!(?err, "failed to persist identity");
+                                self.last_ui_error =
+                                    Some("Failed to save identity to disk".to_string());
+                            } else {
+                                self.last_ui_error = None;
+                            }
+                            self.identity_display = display;
                             self.identity = Some(id);
-                            self.last_ui_error = None;
                         }
                         Err(err) => {
                             tracing::error!(?err, "failed to generate identity");
@@ -107,10 +122,51 @@ impl eframe::App for App {
 
 impl App {
     fn new(runtime: Arc<Runtime>) -> Self {
+        let mut identity = None;
+        let mut identity_display = String::new();
+        let mut last_ui_error = None;
+        let mut peer_log = VecDeque::new();
+        let mut cached_bootstrap = Vec::new();
+
+        match load_identity_from_disk() {
+            Ok(Some(id)) => {
+                info!("loaded persisted identity");
+                identity_display = id.format_public_key();
+                identity = Some(id);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(?err, "failed to load persisted identity");
+                last_ui_error = Some("Failed to load saved identity".to_string());
+            }
+        }
+
+        match load_cached_peers() {
+            Ok(peers) => {
+                if !peers.is_empty() {
+                    info!(count = peers.len(), "loaded cached bootstrap peers");
+                    for addr in &peers {
+                        peer_log.push_back(format!("Cached peer {addr}"));
+                    }
+                    cached_bootstrap = peers;
+                    if let Err(err) = persist_known_peers(&cached_bootstrap) {
+                        tracing::error!(?err, "failed to refresh bootstrap cache on load");
+                        last_ui_error.get_or_insert(
+                            "Failed to refresh bootstrap cache".to_string(),
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed to load cached peers");
+                last_ui_error.get_or_insert("Failed to load bootstrap cache".to_string());
+            }
+        }
+
         Self {
             runtime,
-            identity: None,
-            identity_display: String::new(),
+            identity,
+            identity_display,
             overlay: None,
             listen_multiaddr_input: DEFAULT_LISTEN_ADDR.to_string(),
             bootstrap_input: String::new(),
@@ -120,7 +176,9 @@ impl App {
             publish_public: true,
             find_server_id_input: String::new(),
             dial_addr_input: String::new(),
-            last_ui_error: None,
+            last_ui_error,
+            cached_bootstrap,
+            peer_log,
         }
     }
 
@@ -162,6 +220,14 @@ impl App {
                 ui.label("Listening on:");
                 for addr in &overlay.listen_addrs {
                     ui.monospace(addr);
+                }
+            }
+
+            if !self.cached_bootstrap.is_empty() {
+                ui.separator();
+                ui.label("Cached bootstrap peers:");
+                for addr in &self.cached_bootstrap {
+                    ui.monospace(addr.to_string());
                 }
             }
         }
@@ -240,6 +306,19 @@ impl App {
                     }
                 });
         }
+
+        if !self.peer_log.is_empty() {
+            ui.separator();
+            ui.heading("Known peers");
+            egui::ScrollArea::vertical()
+                .id_source("peer-log")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for entry in &self.peer_log {
+                        ui.label(entry);
+                    }
+                });
+        }
     }
 
     fn start_overlay(&mut self, identity: UserIdentity) -> Result<()> {
@@ -252,7 +331,11 @@ impl App {
             );
         }
 
-        let bootstrap_peers = parse_multiaddr_list(&self.bootstrap_input)?;
+        let mut bootstrap_peers = parse_multiaddr_list(&self.bootstrap_input)?;
+        bootstrap_peers.extend(self.cached_bootstrap.iter().cloned());
+
+        let mut seen = HashSet::new();
+        bootstrap_peers.retain(|addr| seen.insert(addr.to_string()));
 
         let config = OverlayConfig {
             identity,
@@ -372,11 +455,58 @@ impl App {
                 }
             };
 
+            let mut discovered = Vec::new();
+            match &event {
+                OverlayEvent::BootstrapDialQueued(addr) => {
+                    discovered.push(addr.clone());
+                }
+                OverlayEvent::ServerAdvertFound { advert, .. } => {
+                    for raw in &advert.bootstrap_addresses {
+                        match raw.parse::<Multiaddr>() {
+                            Ok(addr) => discovered.push(addr),
+                            Err(err) => warn!(%raw, ?err, "skipping invalid advert address"),
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            for addr in discovered {
+                self.record_known_peer(addr);
+            }
+
             if let Some(overlay) = self.overlay.as_mut() {
                 handle_overlay_event(overlay, event, &mut self.last_ui_error);
             } else {
                 break;
             }
+        }
+    }
+
+    fn record_known_peer(&mut self, addr: Multiaddr) {
+        if self
+            .cached_bootstrap
+            .iter()
+            .any(|existing| existing == &addr)
+        {
+            return;
+        }
+
+        if self.cached_bootstrap.len() >= MAX_KNOWN_PEERS {
+            self.cached_bootstrap.remove(0);
+        }
+        self.cached_bootstrap.push(addr.clone());
+
+        let entry = format!("Cached peer {addr}");
+        self.peer_log.push_front(entry);
+        while self.peer_log.len() > MAX_KNOWN_PEERS {
+            self.peer_log.pop_back();
+        }
+
+        if let Err(err) = persist_known_peers(&self.cached_bootstrap) {
+            tracing::error!(?err, "failed to persist bootstrap peers");
+            self.last_ui_error
+                .get_or_insert("Failed to persist bootstrap peers".to_string());
         }
     }
 }
@@ -456,6 +586,7 @@ impl OverlayHandle {
 
 const DEFAULT_LISTEN_ADDR: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
 const MAX_EVENT_LOG_ENTRIES: usize = 128;
+const MAX_KNOWN_PEERS: usize = 64;
 
 fn parse_multiaddr_list(input: &str) -> Result<Vec<Multiaddr>> {
     let mut out = Vec::new();
@@ -468,4 +599,92 @@ fn parse_multiaddr_list(input: &str) -> Result<Vec<Multiaddr>> {
         out.push(addr);
     }
     Ok(out)
+}
+
+fn persist_known_peers(peers: &[Multiaddr]) -> Result<()> {
+    if let Some(path) = peers_storage_path() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create peer cache directory at {}", parent.display()))?;
+        }
+        let serialized: Vec<String> = peers.iter().map(|addr| addr.to_string()).collect();
+        let data = serde_json::to_vec(&serialized).context("serialize bootstrap peers")?;
+        fs::write(&path, data)
+            .with_context(|| format!("write bootstrap peers at {}", path.display()))?;
+        info!(path = %path.display(), count = peers.len(), "persisted bootstrap peers");
+    }
+    Ok(())
+}
+
+fn load_cached_peers() -> Result<Vec<Multiaddr>> {
+    let Some(path) = peers_storage_path() else {
+        return Ok(Vec::new());
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let data =
+        fs::read(&path).with_context(|| format!("read bootstrap peers at {}", path.display()))?;
+    let encoded: Vec<String> = serde_json::from_slice(&data)
+        .with_context(|| format!("deserialize bootstrap peers at {}", path.display()))?;
+
+    let mut peers = Vec::new();
+    for raw in encoded {
+        match raw.parse::<Multiaddr>() {
+            Ok(addr) => peers.push(addr),
+            Err(err) => warn!(%raw, ?err, "skipping invalid cached peer"),
+        }
+    }
+
+    if peers.len() > MAX_KNOWN_PEERS {
+        peers.truncate(MAX_KNOWN_PEERS);
+    }
+
+    Ok(peers)
+}
+
+fn persist_identity(identity: &UserIdentity) -> Result<()> {
+    if let Some(path) = identity_storage_path() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create identity directory at {}", parent.display()))?;
+        }
+        let data = serde_json::to_vec(identity).context("serialize identity")?;
+        fs::write(&path, data)
+            .with_context(|| format!("write identity file at {}", path.display()))?;
+        info!(path = %path.display(), "persisted identity");
+    } else {
+        warn!("unable to determine identity storage directory; identity will not persist");
+    }
+    Ok(())
+}
+
+fn load_identity_from_disk() -> Result<Option<UserIdentity>> {
+    let Some(path) = identity_storage_path() else {
+        warn!("no project directory available for identity storage");
+        return Ok(None);
+    };
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let data =
+        fs::read(&path).with_context(|| format!("read identity file at {}", path.display()))?;
+    let identity: UserIdentity = serde_json::from_slice(&data)
+        .with_context(|| format!("deserialize identity file at {}", path.display()))?;
+    Ok(Some(identity))
+}
+
+fn identity_storage_path() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_dir().join("identity.json"))
+}
+
+fn peers_storage_path() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_dir().join("bootstrap_peers.json"))
+}
+
+fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("com", "vinxis", "messaging")
 }
