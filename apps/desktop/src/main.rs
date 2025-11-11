@@ -6,7 +6,7 @@ use libp2p::Multiaddr;
 use messaging_proto::core::ServerAdvert;
 use net_overlay::{OverlayCommand, OverlayConfig, OverlayEvent, OverlayNode};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque, btree_map::Entry},
     fs,
     path::PathBuf,
     sync::Arc,
@@ -68,6 +68,7 @@ struct App {
     last_ui_error: Option<String>,
     cached_bootstrap: Vec<Multiaddr>,
     peer_log: VecDeque<String>,
+    discovered_servers: BTreeMap<String, ServerAdvert>,
 }
 
 impl eframe::App for App {
@@ -127,6 +128,7 @@ impl App {
         let mut last_ui_error = None;
         let mut peer_log = VecDeque::new();
         let mut cached_bootstrap = Vec::new();
+        let discovered_servers = BTreeMap::new();
 
         match load_identity_from_disk() {
             Ok(Some(id)) => {
@@ -178,6 +180,7 @@ impl App {
             last_ui_error,
             cached_bootstrap,
             peer_log,
+            discovered_servers,
         }
     }
 
@@ -293,6 +296,64 @@ impl App {
             }
         }
 
+        if !self.discovered_servers.is_empty() {
+            ui.separator();
+            ui.heading("Discovered servers");
+
+            let entries: Vec<_> = self
+                .discovered_servers
+                .iter()
+                .map(|(id, advert)| (id.clone(), advert.clone()))
+                .collect();
+
+            for (server_id, advert) in entries {
+                let addresses = advert.bootstrap_addresses.clone();
+                let mut fill_addr: Option<String> = None;
+                let mut cache_all = false;
+
+                ui.group(|ui| {
+                    ui.heading(&advert.display_name);
+                    ui.label(format!("Server ID: {server_id}"));
+                    ui.label(format!(
+                        "Public: {}",
+                        if advert.is_public { "yes" } else { "no" }
+                    ));
+                    if addresses.is_empty() {
+                        ui.label("No bootstrap addresses advertised");
+                    } else {
+                        ui.label("Bootstrap addresses:");
+                        for addr in &addresses {
+                            ui.monospace(addr);
+                        }
+                        ui.horizontal(|ui| {
+                            if let Some(addr) = addresses.first() {
+                                if ui.button("Fill dial").clicked() {
+                                    fill_addr = Some(addr.clone());
+                                }
+                            }
+                            if ui.button("Cache all").clicked() {
+                                cache_all = true;
+                            }
+                        });
+                    }
+                });
+
+                if let Some(addr) = fill_addr {
+                    self.dial_addr_input = addr;
+                    self.last_ui_error = None;
+                }
+
+                if cache_all {
+                    for raw in addresses {
+                        match raw.parse::<Multiaddr>() {
+                            Ok(addr) => self.record_known_peer(addr),
+                            Err(err) => warn!(%raw, ?err, "failed to cache advert address"),
+                        }
+                    }
+                }
+            }
+        }
+
         ui.separator();
         ui.heading("Overlay events");
         if let Some(overlay) = &self.overlay {
@@ -380,13 +441,16 @@ impl App {
         };
 
         let sender = overlay.node.command_sender();
+        let advert_clone = advert.clone();
         self.runtime
-            .block_on(sender.send(OverlayCommand::PublishServerAdvert(advert)))
+            .block_on(sender.send(OverlayCommand::PublishServerAdvert(advert_clone)))
             .map_err(|err| anyhow::anyhow!("command channel closed: {err}"))?;
 
         if let Some(overlay) = &mut self.overlay {
             overlay.push_event(format!("Publish requested for {server_id}"));
         }
+
+        self.record_server_advert(advert);
 
         Ok(())
     }
@@ -454,24 +518,14 @@ impl App {
                 }
             };
 
-            let mut discovered = Vec::new();
             match &event {
                 OverlayEvent::BootstrapDialQueued(addr) => {
-                    discovered.push(addr.clone());
+                    self.record_known_peer(addr.clone());
                 }
                 OverlayEvent::ServerAdvertFound { advert, .. } => {
-                    for raw in &advert.bootstrap_addresses {
-                        match raw.parse::<Multiaddr>() {
-                            Ok(addr) => discovered.push(addr),
-                            Err(err) => warn!(%raw, ?err, "skipping invalid advert address"),
-                        }
-                    }
+                    self.record_server_advert(advert.clone());
                 }
                 _ => {}
-            }
-
-            for addr in discovered {
-                self.record_known_peer(addr);
             }
 
             if let Some(overlay) = self.overlay.as_mut() {
@@ -506,6 +560,44 @@ impl App {
             tracing::error!(?err, "failed to persist bootstrap peers");
             self.last_ui_error
                 .get_or_insert("Failed to persist bootstrap peers".to_string());
+        }
+    }
+
+    fn record_server_advert(&mut self, advert: ServerAdvert) {
+        let server_id = advert.server_id.clone();
+        let display_name = advert.display_name.clone();
+
+        let is_existing = self.discovered_servers.contains_key(&server_id);
+        if !is_existing && self.discovered_servers.len() >= MAX_DISCOVERED_SERVERS {
+            if let Some(oldest) = self.discovered_servers.keys().next().cloned() {
+                self.discovered_servers.remove(&oldest);
+            }
+        }
+
+        let mut newly_inserted = false;
+        match self.discovered_servers.entry(server_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(advert.clone());
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(advert.clone());
+                newly_inserted = true;
+            }
+        }
+
+        if newly_inserted {
+            self.peer_log
+                .push_front(format!("Discovered server {server_id} ({display_name})"));
+            while self.peer_log.len() > MAX_KNOWN_PEERS {
+                self.peer_log.pop_back();
+            }
+        }
+
+        for raw in &advert.bootstrap_addresses {
+            match raw.parse::<Multiaddr>() {
+                Ok(addr) => self.record_known_peer(addr),
+                Err(err) => warn!(%raw, ?err, "skipping advert address"),
+            }
         }
     }
 }
@@ -586,6 +678,7 @@ impl OverlayHandle {
 const DEFAULT_LISTEN_ADDR: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
 const MAX_EVENT_LOG_ENTRIES: usize = 128;
 const MAX_KNOWN_PEERS: usize = 64;
+const MAX_DISCOVERED_SERVERS: usize = 128;
 
 fn parse_multiaddr_list(input: &str) -> Result<Vec<Multiaddr>> {
     let mut out = Vec::new();
