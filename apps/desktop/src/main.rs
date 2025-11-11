@@ -12,6 +12,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
+use storage_ledger::Ledger;
 use tokio::{runtime::Runtime, sync::mpsc::error::TryRecvError};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -73,6 +74,8 @@ struct App {
     loaded_catalog_message: Option<String>,
     loaded_ui_state_message: Option<String>,
     ui_state_dirty: bool,
+    ledger: Option<Ledger>,
+    ledger_status_message: Option<String>,
 }
 
 impl eframe::App for App {
@@ -84,6 +87,17 @@ impl eframe::App for App {
 
             if let Some(err) = &self.last_ui_error {
                 ui.colored_label(Color32::from_rgb(200, 50, 50), err);
+                ui.separator();
+            }
+
+            if let Some(msg) = &self.ledger_status_message {
+                ui.label(msg);
+                if self.ledger.is_none() {
+                    ui.colored_label(
+                        Color32::from_rgb(200, 120, 0),
+                        "Ledger unavailable; channel history will not persist.",
+                    );
+                }
                 ui.separator();
             }
 
@@ -145,6 +159,8 @@ impl App {
         let mut discovered_servers = BTreeMap::new();
         let mut loaded_catalog_message = None;
         let mut loaded_ui_state_message = None;
+        let mut ledger = None;
+        let mut ledger_status_message = None;
         let mut listen_multiaddr_input = DEFAULT_LISTEN_ADDR.to_string();
         let mut bootstrap_input = String::new();
         let mut additional_advertise_input = String::new();
@@ -215,6 +231,20 @@ impl App {
             }
         }
 
+        match open_ledger_store() {
+            Ok(Some((opened, path))) => {
+                ledger = Some(opened);
+                ledger_status_message = Some(format!("Ledger ready at {}", path));
+            }
+            Ok(None) => {
+                ledger_status_message = Some("Ledger storage disabled".to_string());
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed to initialize ledger storage");
+                last_ui_error.get_or_insert("Failed to initialize ledger storage".to_string());
+            }
+        }
+
         Self {
             runtime,
             identity,
@@ -235,6 +265,8 @@ impl App {
             loaded_catalog_message,
             loaded_ui_state_message,
             ui_state_dirty: false,
+            ledger,
+            ledger_status_message,
         }
     }
 
@@ -947,6 +979,22 @@ fn load_overlay_settings() -> Result<Option<OverlaySettingsSnapshot>> {
     Ok(Some(settings))
 }
 
+fn open_ledger_store() -> Result<Option<(Ledger, String)>> {
+    let Some(path) = ledger_storage_path() else {
+        warn!("no project directory available for ledger storage");
+        return Ok(None);
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create ledger directory at {}", parent.display()))?;
+    }
+
+    let ledger = Ledger::open(&path)
+        .with_context(|| format!("open ledger database at {}", path.display()))?;
+    Ok(Some((ledger, path.display().to_string())))
+}
+
 fn persist_server_catalog(catalog: &BTreeMap<String, ServerAdvert>) -> Result<()> {
     if let Some(path) = server_catalog_path() {
         if let Some(parent) = path.parent() {
@@ -1045,6 +1093,10 @@ fn peers_storage_path() -> Option<PathBuf> {
 
 fn overlay_settings_path() -> Option<PathBuf> {
     project_dirs().map(|dirs| dirs.data_dir().join("overlay_settings.json"))
+}
+
+fn ledger_storage_path() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_dir().join("ledger"))
 }
 
 fn server_catalog_path() -> Option<PathBuf> {
