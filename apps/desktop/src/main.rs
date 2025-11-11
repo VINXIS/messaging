@@ -151,9 +151,8 @@ impl App {
                     cached_bootstrap = peers;
                     if let Err(err) = persist_known_peers(&cached_bootstrap) {
                         tracing::error!(?err, "failed to refresh bootstrap cache on load");
-                        last_ui_error.get_or_insert(
-                            "Failed to refresh bootstrap cache".to_string(),
-                        );
+                        last_ui_error
+                            .get_or_insert("Failed to refresh bootstrap cache".to_string());
                     }
                 }
             }
