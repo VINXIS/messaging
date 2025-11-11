@@ -232,11 +232,20 @@ impl App {
         }
 
         match open_ledger_store() {
-            Ok(Some((opened, path))) => {
+            Ok(LedgerInit::Ready {
+                ledger: opened,
+                path,
+            }) => {
                 ledger = Some(opened);
                 ledger_status_message = Some(format!("Ledger ready at {}", path));
             }
-            Ok(None) => {
+            Ok(LedgerInit::Locked { path }) => {
+                ledger_status_message = Some(format!(
+                    "Ledger already in use at {}; running without persistence.",
+                    path
+                ));
+            }
+            Ok(LedgerInit::Disabled) => {
                 ledger_status_message = Some("Ledger storage disabled".to_string());
             }
             Err(err) => {
@@ -989,10 +998,10 @@ fn load_overlay_settings() -> Result<Option<OverlaySettingsSnapshot>> {
     Ok(Some(settings))
 }
 
-fn open_ledger_store() -> Result<Option<(Ledger, String)>> {
+fn open_ledger_store() -> Result<LedgerInit> {
     let Some(path) = ledger_storage_path() else {
         warn!("no project directory available for ledger storage");
-        return Ok(None);
+        return Ok(LedgerInit::Disabled);
     };
 
     if let Some(parent) = path.parent() {
@@ -1000,9 +1009,26 @@ fn open_ledger_store() -> Result<Option<(Ledger, String)>> {
             .with_context(|| format!("create ledger directory at {}", parent.display()))?;
     }
 
-    let ledger = Ledger::open(&path)
-        .with_context(|| format!("open ledger database at {}", path.display()))?;
-    Ok(Some((ledger, path.display().to_string())))
+    match Ledger::open(&path).with_context(|| format!("open ledger database at {}", path.display()))
+    {
+        Ok(ledger) => Ok(LedgerInit::Ready {
+            ledger,
+            path: path.display().to_string(),
+        }),
+        Err(err) => {
+            if is_ledger_lock_error(&err) {
+                warn!(
+                    path = %path.display(),
+                    "ledger already in use by another process; persistence disabled for this session"
+                );
+                Ok(LedgerInit::Locked {
+                    path: path.display().to_string(),
+                })
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 fn persist_server_catalog(catalog: &BTreeMap<String, ServerAdvert>) -> Result<()> {
@@ -1123,6 +1149,16 @@ fn ensure_peer_id_suffix(addr: &str, peer_id: &str) -> String {
     } else {
         format!("{addr}/p2p/{peer_id}")
     }
+}
+
+fn is_ledger_lock_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("could not acquire lock")
+}
+
+enum LedgerInit {
+    Ready { ledger: Ledger, path: String },
+    Locked { path: String },
+    Disabled,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
