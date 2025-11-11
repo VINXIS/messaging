@@ -71,6 +71,8 @@ struct App {
     peer_log: VecDeque<String>,
     discovered_servers: BTreeMap<String, ServerAdvert>,
     loaded_catalog_message: Option<String>,
+    loaded_ui_state_message: Option<String>,
+    ui_state_dirty: bool,
 }
 
 impl eframe::App for App {
@@ -82,6 +84,11 @@ impl eframe::App for App {
 
             if let Some(err) = &self.last_ui_error {
                 ui.colored_label(Color32::from_rgb(200, 50, 50), err);
+                ui.separator();
+            }
+
+            if let Some(message) = self.loaded_ui_state_message.take() {
+                ui.colored_label(Color32::from_rgb(60, 170, 60), message);
                 ui.separator();
             }
 
@@ -137,6 +144,10 @@ impl App {
         let mut cached_bootstrap = Vec::new();
         let mut discovered_servers = BTreeMap::new();
         let mut loaded_catalog_message = None;
+        let mut loaded_ui_state_message = None;
+        let mut listen_multiaddr_input = DEFAULT_LISTEN_ADDR.to_string();
+        let mut bootstrap_input = String::new();
+        let mut additional_advertise_input = String::new();
 
         match load_identity_from_disk() {
             Ok(Some(id)) => {
@@ -172,6 +183,22 @@ impl App {
             }
         }
 
+        match load_overlay_settings() {
+            Ok(Some(settings)) => {
+                if !settings.listen_multiaddr.is_empty() {
+                    listen_multiaddr_input = settings.listen_multiaddr;
+                }
+                bootstrap_input = settings.bootstrap_peers;
+                additional_advertise_input = settings.additional_advertise;
+                loaded_ui_state_message = Some("Restored overlay settings".to_string());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(?err, "failed to load overlay settings");
+                last_ui_error.get_or_insert("Failed to load overlay settings".to_string());
+            }
+        }
+
         match load_server_catalog() {
             Ok(Some(catalog)) => {
                 if !catalog.is_empty() {
@@ -193,9 +220,9 @@ impl App {
             identity,
             identity_display,
             overlay: None,
-            listen_multiaddr_input: DEFAULT_LISTEN_ADDR.to_string(),
-            bootstrap_input: String::new(),
-            additional_advertise_input: String::new(),
+            listen_multiaddr_input,
+            bootstrap_input,
+            additional_advertise_input,
             server_id_input: String::new(),
             server_name_input: String::new(),
             publish_public: true,
@@ -206,6 +233,8 @@ impl App {
             peer_log,
             discovered_servers,
             loaded_catalog_message,
+            loaded_ui_state_message,
+            ui_state_dirty: false,
         }
     }
 
@@ -213,11 +242,18 @@ impl App {
         if self.overlay.is_none() {
             ui.heading("Overlay setup");
             ui.label("Listen multiaddrs (one per line, blank uses default)");
-            ui.text_edit_multiline(&mut self.listen_multiaddr_input);
+            if ui
+                .text_edit_multiline(&mut self.listen_multiaddr_input)
+                .changed()
+            {
+                self.ui_state_dirty = true;
+            }
 
             ui.add_space(4.0);
             ui.label("Bootstrap peers (optional, one per line)");
-            ui.text_edit_multiline(&mut self.bootstrap_input);
+            if ui.text_edit_multiline(&mut self.bootstrap_input).changed() {
+                self.ui_state_dirty = true;
+            }
 
             if ui.button("Start overlay").clicked() {
                 match self.start_overlay(identity.clone()) {
@@ -230,6 +266,8 @@ impl App {
                     }
                 }
             }
+
+            self.render_overlay_settings_footer(ui, true);
 
             if !self.cached_bootstrap.is_empty() || !self.discovered_servers.is_empty() {
                 ui.add_space(6.0);
@@ -278,7 +316,14 @@ impl App {
         });
         ui.checkbox(&mut self.publish_public, "Public server");
         ui.label("Additional advertised addresses (optional)");
-        ui.text_edit_multiline(&mut self.additional_advertise_input);
+        if ui
+            .text_edit_multiline(&mut self.additional_advertise_input)
+            .changed()
+        {
+            self.ui_state_dirty = true;
+        }
+
+        self.render_overlay_settings_footer(ui, false);
 
         if ui.button("Publish advert").clicked() {
             match self.publish_server_advert() {
@@ -420,6 +465,61 @@ impl App {
         }
     }
 
+    fn render_overlay_settings_footer(&mut self, ui: &mut egui::Ui, allow_reset: bool) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if allow_reset && ui.button("Reset to defaults").clicked() {
+                self.reset_overlay_settings();
+            }
+
+            let save_clicked = ui
+                .add_enabled(
+                    self.ui_state_dirty,
+                    egui::Button::new("Save overlay settings"),
+                )
+                .clicked();
+            if save_clicked {
+                self.persist_overlay_settings_inputs(Some("Overlay settings saved"));
+            }
+
+            if self.ui_state_dirty {
+                ui.add_space(6.0);
+                ui.colored_label(Color32::from_rgb(200, 120, 0), "Unsaved changes");
+            }
+        });
+    }
+
+    fn persist_overlay_settings_inputs(&mut self, success_message: Option<&str>) {
+        let snapshot = OverlaySettingsSnapshot {
+            listen_multiaddr: self.listen_multiaddr_input.clone(),
+            bootstrap_peers: self.bootstrap_input.clone(),
+            additional_advertise: self.additional_advertise_input.clone(),
+        };
+
+        match persist_overlay_settings(&snapshot) {
+            Ok(()) => {
+                self.ui_state_dirty = false;
+                if let Some(msg) = success_message {
+                    self.loaded_ui_state_message = Some(msg.to_string());
+                }
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed to persist overlay settings");
+                self.last_ui_error
+                    .get_or_insert("Failed to save overlay settings".to_string());
+            }
+        }
+    }
+
+    fn reset_overlay_settings(&mut self) {
+        self.listen_multiaddr_input = DEFAULT_LISTEN_ADDR.to_string();
+        self.bootstrap_input.clear();
+        self.additional_advertise_input.clear();
+        self.ui_state_dirty = true;
+        self.loaded_ui_state_message =
+            Some("Overlay settings reset to defaults (unsaved)".to_string());
+    }
+
     fn start_overlay(&mut self, identity: UserIdentity) -> Result<()> {
         let mut listen_addrs = parse_multiaddr_list(&self.listen_multiaddr_input)?;
         if listen_addrs.is_empty() {
@@ -450,6 +550,7 @@ impl App {
         let mut handle = OverlayHandle::new(node);
         handle.push_event("Overlay launched");
         self.overlay = Some(handle);
+        self.persist_overlay_settings_inputs(Some("Overlay settings saved"));
         Ok(())
     }
 
@@ -490,6 +591,7 @@ impl App {
         }
 
         self.record_server_advert(advert);
+        self.persist_overlay_settings_inputs(None);
 
         Ok(())
     }
@@ -813,6 +915,38 @@ fn load_cached_peers() -> Result<Vec<Multiaddr>> {
     Ok(peers)
 }
 
+fn persist_overlay_settings(settings: &OverlaySettingsSnapshot) -> Result<()> {
+    if let Some(path) = overlay_settings_path() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create overlay settings directory at {}", parent.display())
+            })?;
+        }
+
+        let data = serde_json::to_vec(settings).context("serialize overlay settings")?;
+        fs::write(&path, data)
+            .with_context(|| format!("write overlay settings at {}", path.display()))?;
+        info!(path = %path.display(), "persisted overlay settings");
+    }
+    Ok(())
+}
+
+fn load_overlay_settings() -> Result<Option<OverlaySettingsSnapshot>> {
+    let Some(path) = overlay_settings_path() else {
+        return Ok(None);
+    };
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let data =
+        fs::read(&path).with_context(|| format!("read overlay settings at {}", path.display()))?;
+    let settings: OverlaySettingsSnapshot = serde_json::from_slice(&data)
+        .with_context(|| format!("deserialize overlay settings at {}", path.display()))?;
+    Ok(Some(settings))
+}
+
 fn persist_server_catalog(catalog: &BTreeMap<String, ServerAdvert>) -> Result<()> {
     if let Some(path) = server_catalog_path() {
         if let Some(parent) = path.parent() {
@@ -909,12 +1043,23 @@ fn peers_storage_path() -> Option<PathBuf> {
     project_dirs().map(|dirs| dirs.data_dir().join("bootstrap_peers.json"))
 }
 
+fn overlay_settings_path() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_dir().join("overlay_settings.json"))
+}
+
 fn server_catalog_path() -> Option<PathBuf> {
     project_dirs().map(|dirs| dirs.data_dir().join("server_catalog.json"))
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "vinxis", "messaging")
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OverlaySettingsSnapshot {
+    listen_multiaddr: String,
+    bootstrap_peers: String,
+    additional_advertise: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
