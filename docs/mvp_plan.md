@@ -43,6 +43,7 @@
 3. Implement invite flow and server membership state tracking.
 4. Integrate storage ledger with networking so incoming messages are decrypted (once key exchange implemented) and persisted.
 5. Build desktop UI flows for server list, channel view, and diagnostics.
-6. Add integration tests and simulation harness for churn/resilience verification.
+6. Iterate on desktop UX so non-technical users can navigate core flows without prior networking knowledge.
+7. Add integration tests and simulation harness for churn/resilience verification.
 
 This document will evolve as features land; each milestone should update the plan with implementation details and testing notes.
